@@ -3,6 +3,7 @@ import json
 import requests
 from typing import Dict, List
 from flask import Flask, request, jsonify
+from transformers import pipeline
 
 class OnCallBot:
     def __init__(self, confluence_base_url: str, confluence_page_id: str, confluence_api_key: str, pagerduty_api_key: str):
@@ -12,6 +13,7 @@ class OnCallBot:
         self.pagerduty_api_key = pagerduty_api_key
         self.team_contacts = self.fetch_team_contacts()
         self.runbooks = self.fetch_runbooks_from_confluence()
+        self.nlp = pipeline("text2text-generation", model="t5-base")
 
     def fetch_team_contacts(self) -> Dict[str, str]:
         url = 'https://api.pagerduty.com/teams'
@@ -123,22 +125,77 @@ class OnCallBot:
         return None
 
     def execute_runbook(self, runbook: Dict, alert: Dict):
-        for step in runbook.get('steps', []):
-            action = step.get('action')
-            if action == 'check_metric':
-                self.check_metric(step.get('metric'), step.get('threshold'))
-            elif action == 'restart_service':
-                self.restart_service(step.get('service_name'))
-            elif action == 'notify_team':
-                self.notify_team(step.get('message'), alert)
+        steps = runbook.get('steps', [])
+        for step in steps:
+            action = self.nlp(step['action'])[0]['generated_text']
+            if 'resolve the alert' in action:
+                self.resolve_alert(alert)
+            elif 'check' in action and 'metric' in action:
+                metric = self.extract_metric(action)
+                threshold = self.extract_threshold(action)
+                self.check_metric(metric, threshold)
+            elif 'restart' in action and 'service' in action:
+                service_name = self.extract_service_name(action)
+                self.restart_service(service_name)
+            elif 'notify' in action and 'team' in action:
+                message = self.extract_message(action)
+                self.notify_team(message, alert)
+            else:
+                print(f"Unknown action: {action}")
+
+    def resolve_alert(self, alert: Dict):
+        incident_id = alert.get('id')
+        url = f'https://api.pagerduty.com/incidents/{incident_id}'
+        headers = {
+            'Authorization': f'Token token={self.pagerduty_api_key}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/vnd.pagerduty+json;version=2'
+        }
+        payload = {
+            'incident': {
+                'type': 'incident_reference',
+                'status': 'resolved'
+            }
+        }
+        response = requests.put(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            print(f"Alert {incident_id} resolved successfully.")
+        else:
+            print(f"Failed to resolve alert {incident_id}: {response.status_code} - {response.text}")
+
+    def extract_metric(self, action: str) -> str:
+        # Extract metric from the action string
+        # Example: "check CPU usage metric" -> "CPU usage"
+        return action.split('metric')[0].strip()
+
+    def extract_threshold(self, action: str) -> float:
+        # Extract threshold from the action string
+        # Example: "check CPU usage metric if above 90%" -> 90.0
+        words = action.split()
+        for word in words:
+            if word.replace('.', '', 1).isdigit():
+                return float(word)
+        return 0.0
+
+    def extract_service_name(self, action: str) -> str:
+        # Extract service name from the action string
+        # Example: "restart the database service" -> "database"
+        return action.split('service')[0].strip()
+
+    def extract_message(self, action: str) -> str:
+        # Extract message from the action string
+        # Example: "notify the team with message 'Service down'" -> "Service down"
+        if 'message' in action:
+            return action.split('message')[1].strip().strip("'\"")
+        return "No message provided"
 
     def check_metric(self, metric: str, threshold: float):
         # Implement metric checking logic here
-        pass
+        print(f"Checking metric {metric} with threshold {threshold}")
 
     def restart_service(self, service_name: str):
         # Implement service restart logic here
-        pass
+        print(f"Restarting service {service_name}")
 
     def notify_team(self, message: str, alert: Dict):
         team = alert.get('team')
